@@ -25,8 +25,11 @@ import (
 
 	"k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/util/sets"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 	v1helper "k8s.io/kubernetes/pkg/apis/core/v1/helper"
 	"k8s.io/kubernetes/pkg/features"
 	schedutil "k8s.io/kubernetes/pkg/scheduler/util"
@@ -65,13 +68,94 @@ func (pqi *QueuedPodInfo) DeepCopy() *QueuedPodInfo {
 // accelerate processing. This information is typically immutable (e.g., pre-processed
 // inter-pod affinity selectors).
 type PodInfo struct {
-	Pod *v1.Pod
+	Pod                        *v1.Pod
+	RequiredAffinityTerms      []AffinityTerm
+	RequiredAntiAffinityTerms  []AffinityTerm
+	PreferredAffinityTerms     []WeightedAffinityTerm
+	PreferredAntiAffinityTerms []WeightedAffinityTerm
+}
+
+// AffinityTerm is a processed version of v1.PodAffinityTerm.
+type AffinityTerm struct {
+	Namespaces  sets.String
+	Selector    labels.Selector
+	TopologyKey string
+}
+
+// WeightedAffinityTerm is a "processed" representation of v1.WeightedAffinityTerm.
+type WeightedAffinityTerm struct {
+	AffinityTerm
+	Weight int32
+}
+
+func newAffinityTerm(pod *v1.Pod, term *v1.PodAffinityTerm) *AffinityTerm {
+	namespaces := schedutil.GetNamespacesFromPodAffinityTerm(pod, term)
+	selector, err := metav1.LabelSelectorAsSelector(term.LabelSelector)
+	if err != nil {
+		klog.Errorf("Cannot process label selector: %v", err)
+		return nil
+	}
+	return &AffinityTerm{Namespaces: namespaces, Selector: selector, TopologyKey: term.TopologyKey}
+}
+
+// getAffinityTerms receives a Pod and affinity terms and returns the namespaces and
+// selectors of the terms.
+func getAffinityTerms(pod *v1.Pod, v1Terms []v1.PodAffinityTerm) []AffinityTerm {
+	if v1Terms == nil {
+		return nil
+	}
+
+	var terms []AffinityTerm
+	for _, term := range v1Terms {
+		t := newAffinityTerm(pod, &term)
+		if t == nil {
+			// We get here if the label selector failed to process, this is not supposed
+			// to happen because the pod should have been validated by the api server.
+			return nil
+		}
+		terms = append(terms, *t)
+	}
+	return terms
+}
+
+// getWeightedAffinityTerms returns the list of processed affinity terms.
+func getWeightedAffinityTerms(pod *v1.Pod, v1Terms []v1.WeightedPodAffinityTerm) []WeightedAffinityTerm {
+	if v1Terms == nil {
+		return nil
+	}
+
+	var terms []WeightedAffinityTerm
+	for _, term := range v1Terms {
+		t := newAffinityTerm(pod, &term.PodAffinityTerm)
+		if t == nil {
+			// We get here if the label selector failed to process, this is not supposed
+			// to happen because the pod should have been validated by the api server.
+			return nil
+		}
+		terms = append(terms, WeightedAffinityTerm{AffinityTerm: *t, Weight: term.Weight})
+	}
+	return terms
 }
 
 // NewPodInfo return a new PodInfo
 func NewPodInfo(pod *v1.Pod) *PodInfo {
+	var preferredAffinityTerms []v1.WeightedPodAffinityTerm
+	var preferredAntiAffinityTerms []v1.WeightedPodAffinityTerm
+	if affinity := pod.Spec.Affinity; affinity != nil {
+		if a := affinity.PodAffinity; a != nil {
+			preferredAffinityTerms = a.PreferredDuringSchedulingIgnoredDuringExecution
+		}
+		if a := affinity.PodAntiAffinity; a != nil {
+			preferredAntiAffinityTerms = a.PreferredDuringSchedulingIgnoredDuringExecution
+		}
+	}
+
 	return &PodInfo{
-		Pod: pod,
+		Pod:                        pod,
+		RequiredAffinityTerms:      getAffinityTerms(pod, schedutil.GetPodAffinityTerms(pod.Spec.Affinity)),
+		RequiredAntiAffinityTerms:  getAffinityTerms(pod, schedutil.GetPodAntiAffinityTerms(pod.Spec.Affinity)),
+		PreferredAffinityTerms:     getWeightedAffinityTerms(pod, preferredAffinityTerms),
+		PreferredAntiAffinityTerms: getWeightedAffinityTerms(pod, preferredAntiAffinityTerms),
 	}
 }
 
@@ -208,7 +292,10 @@ func (r *Resource) Add(rl v1.ResourceList) {
 		case v1.ResourcePods:
 			r.AllowedPodNumber += int(rQuant.Value())
 		case v1.ResourceEphemeralStorage:
-			r.EphemeralStorage += rQuant.Value()
+			if utilfeature.DefaultFeatureGate.Enabled(features.LocalStorageCapacityIsolation) {
+				// if the local storage capacity isolation feature gate is disabled, pods request 0 disk.
+				r.EphemeralStorage += rQuant.Value()
+			}
 		default:
 			if v1helper.IsScalarResourceName(rName) {
 				r.AddScalar(rName, rQuant.Value())
@@ -458,21 +545,32 @@ func (n *NodeInfo) resetSlicesIfEmpty() {
 	}
 }
 
+// resourceRequest = max(sum(podSpec.Containers), podSpec.InitContainers) + overHead
 func calculateResource(pod *v1.Pod) (res Resource, non0CPU int64, non0Mem int64) {
 	resPtr := &res
 	for _, c := range pod.Spec.Containers {
 		resPtr.Add(c.Resources.Requests)
-
 		non0CPUReq, non0MemReq := schedutil.GetNonzeroRequests(&c.Resources.Requests)
 		non0CPU += non0CPUReq
 		non0Mem += non0MemReq
 		// No non-zero resources for GPUs or opaque resources.
 	}
 
+	for _, ic := range pod.Spec.InitContainers {
+		resPtr.SetMaxResource(ic.Resources.Requests)
+		non0CPUReq, non0MemReq := schedutil.GetNonzeroRequests(&ic.Resources.Requests)
+		if non0CPU < non0CPUReq {
+			non0CPU = non0CPUReq
+		}
+
+		if non0Mem < non0MemReq {
+			non0Mem = non0MemReq
+		}
+	}
+
 	// If Overhead is being utilized, add to the total requests for the pod
 	if pod.Spec.Overhead != nil && utilfeature.DefaultFeatureGate.Enabled(features.PodOverhead) {
 		resPtr.Add(pod.Spec.Overhead)
-
 		if _, found := pod.Spec.Overhead[v1.ResourceCPU]; found {
 			non0CPU += pod.Spec.Overhead.Cpu().MilliValue()
 		}

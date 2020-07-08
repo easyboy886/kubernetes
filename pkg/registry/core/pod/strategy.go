@@ -94,6 +94,7 @@ func (podStrategy) Validate(ctx context.Context, obj runtime.Object) field.Error
 	}
 	allErrs := validation.ValidatePodCreate(pod, opts)
 	allErrs = append(allErrs, validation.ValidateConditionalPod(pod, nil, field.NewPath(""))...)
+
 	return allErrs
 }
 
@@ -113,8 +114,7 @@ func (podStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) 
 		// Allow multiple huge pages on pod create if feature is enabled or if the old pod already has multiple hugepages specified
 		AllowMultipleHugePageResources: oldFailsSingleHugepagesValidation || utilfeature.DefaultFeatureGate.Enabled(features.HugePageStorageMediumSize),
 	}
-	errorList := validation.ValidatePod(obj.(*api.Pod), opts)
-	errorList = append(errorList, validation.ValidatePodUpdate(obj.(*api.Pod), old.(*api.Pod), opts)...)
+	errorList := validation.ValidatePodUpdate(obj.(*api.Pod), old.(*api.Pod), opts)
 	errorList = append(errorList, validation.ValidateConditionalPod(obj.(*api.Pod), old.(*api.Pod), field.NewPath(""))...)
 	return errorList
 }

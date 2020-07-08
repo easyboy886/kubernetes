@@ -37,7 +37,7 @@ import (
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/tools/cache"
 	watchtools "k8s.io/client-go/tools/watch"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 	"k8s.io/kubectl/pkg/cmd/attach"
 	"k8s.io/kubectl/pkg/cmd/exec"
 	"k8s.io/kubectl/pkg/cmd/logs"
@@ -355,21 +355,6 @@ func waitForEphemeralContainer(ctx context.Context, podClient corev1client.PodsG
 	ctx, cancel := watchtools.ContextWithOptionalTimeout(ctx, 0*time.Second)
 	defer cancel()
 
-	preconditionFunc := func(store cache.Store) (bool, error) {
-		_, exists, err := store.Get(&metav1.ObjectMeta{Namespace: ns, Name: podName})
-		if err != nil {
-			return true, err
-		}
-		if !exists {
-			// We need to make sure we see the object in the cache before we start waiting for events
-			// or we would be waiting for the timeout if such object didn't exist.
-			// (e.g. it was deleted before we started informers so they wouldn't even see the delete event)
-			return true, errors.NewNotFound(corev1.Resource("pods"), podName)
-		}
-
-		return false, nil
-	}
-
 	fieldSelector := fields.OneTermEqualSelector("metadata.name", podName).String()
 	lw := &cache.ListWatch{
 		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
@@ -385,7 +370,7 @@ func waitForEphemeralContainer(ctx context.Context, podClient corev1client.PodsG
 	intr := interrupt.New(nil, cancel)
 	var result *corev1.Pod
 	err := intr.Run(func() error {
-		ev, err := watchtools.UntilWithSync(ctx, lw, &corev1.Pod{}, preconditionFunc, func(ev watch.Event) (bool, error) {
+		ev, err := watchtools.UntilWithSync(ctx, lw, &corev1.Pod{}, nil, func(ev watch.Event) (bool, error) {
 			switch ev.Type {
 			case watch.Deleted:
 				return false, errors.NewNotFound(schema.GroupResource{Resource: "pods"}, "")
